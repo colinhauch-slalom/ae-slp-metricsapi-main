@@ -11,7 +11,7 @@
 import { MetricValidator } from '../../src/validation/MetricValidator';
 
 // [DEF-015] describe.skip — none of these tests execute
-describe.skip('MetricValidator', () => {
+describe('MetricValidator', () => {
   let validator: MetricValidator;
 
   beforeEach(() => {
@@ -37,7 +37,7 @@ describe.skip('MetricValidator', () => {
       });
 
       expect(result.valid).toBe(false);
-      expect(result.errors).toContain(expect.stringContaining('name'));
+      expect(result.errors).toEqual(expect.arrayContaining([expect.stringContaining('name')]));
     });
 
     it('should reject empty name', () => {
