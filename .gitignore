@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files
+.env*
+!.env.docker.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.tmp
+
+# Coverage
+coverage/
+
+# Docker data volumes
+data/
+
+# Speckit
+.specify/
+.github/agents/speckit.*
+.github/prompts/speckit.*
+specs/
+broken-project-metricsapi.md

@@ -1,0 +1,116 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "MetricsAPI",
+    "version": "0.9.0",
+    "description": "Metrics ingestion and query service"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local development"
+    }
+  ],
+  "paths": {
+    "/metrics/ingest": {
+      "post": {
+        "summary": "Ingest a metric data point",
+        "description": "Submit a single time-series data point for storage.",
+        "operationId": "ingestMetric",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name", "value", "timestamp"],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Metric identifier",
+                    "example": "cpu.usage"
+                  },
+                  "value": {
+                    "type": "number",
+                    "description": "Numeric observation value",
+                    "example": 72.5
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "ISO 8601 timestamp",
+                    "example": "2026-03-04T12:00:00Z"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Data point ingested successfully"
+          },
+          "400": {
+            "description": "Invalid request body"
+          }
+        }
+      }
+    },
+    "/metrics/query": {
+      "get": {
+        "summary": "Query aggregated metrics",
+        "description": "Retrieve aggregated metric values over a time range.",
+        "operationId": "queryMetrics",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Metric name to query"
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "Start of time range (ISO 8601)"
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "End of time range (ISO 8601)"
+          },
+          {
+            "name": "aggregation",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "enum": ["sum", "average", "percentile"] },
+            "description": "Aggregation type"
+          },
+          {
+            "name": "granularity",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["1m", "5m", "15m", "1h", "1d"] },
+            "description": "Time bucket granularity for results"
+          },
+          {
+            "name": "fill",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["zero", "null", "previous"] },
+            "description": "Fill strategy for empty time buckets"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregated query results"
+          }
+        }
+      }
+    }
+  }
+}

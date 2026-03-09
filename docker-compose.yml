@@ -1,0 +1,70 @@
+# Docker Compose for MetricsAPI
+#
+# [DEF-009] Hardcoded volume mount to /Users/alex/data (author's local path)
+# [DEF-010] Hardcoded password 'alex_local_dev' (not parameterized)
+# [DEF-011] PostgreSQL health check uses `psql` via brew path (macOS-specific)
+
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      METRICS_SERVER_PORT: 3000
+      METRICS_SERVER_HOST: 0.0.0.0
+      METRICS_DB_HOST: postgres
+      METRICS_DB_PORT: 5432
+      METRICS_DB_NAME: metricsapi
+      # [DEF-010] Hardcoded password — not a variable reference
+      METRICS_DB_PASSWORD: alex_local_dev
+      METRICS_DB_USER: postgres
+      METRICS_REDIS_HOST: redis
+      METRICS_REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      # [DEF-009] Hardcoded to the original author's macOS home path
+      - /Users/alex/data:/app/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: metricsapi
+      # [DEF-010] Hardcoded password — should be in .env or secrets
+      POSTGRES_PASSWORD: alex_local_dev
+      POSTGRES_USER: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    # [DEF-011] Health check calls psql through brew path — only works on macOS with
+    # PostgreSQL installed via Homebrew. Will fail in CI, Linux, or Windows.
+    healthcheck:
+      test: [
+        "CMD",
+        "/opt/homebrew/bin/psql",
+        "-U", "postgres",
+        "-d", "metricsapi",
+        "-c", "SELECT 1"
+      ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
