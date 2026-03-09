@@ -6,6 +6,323 @@
 
 ---
 
+## Findings Summary
+
+This document presents a comprehensive analysis of the `ae-slp-metricsapi-main` repository — a Node.js/TypeScript metrics ingestion and query API backed by PostgreSQL and Redis, orchestrated via Docker Compose.
+
+### What Was Explored
+
+The analysis covered four areas:
+
+1. **Static code review** — all source files, configuration, Docker infrastructure, and documentation
+2. **Test suite analysis** — all 7 test suites (48 tests), including skipped tests and correctness of assertions
+3. **Docker Compose operability** — whether the application can actually be built and run as documented
+4. **Runtime behavior** — live endpoint testing via Docker Compose to verify ingest, query, and health check behavior
+
+### What Was Found
+
+**30 findings** were identified across all severity levels:
+
+| Severity | Count | Highlights |
+|----------|-------|------------|
+| 🔴 Critical | 5 | No authentication, hardcoded credentials, no rate limiting, Redis exposed without a password, container runs as root |
+| 🟠 High | 6 | Logger silently drops all errors, all HTTP errors return 500, health check is a no-op, percentile calculation is wrong |
+| 🟡 Medium | 10 | Documentation doesn't match implementation, ~900 lines of dead code (unused plugin system, services, models), over-engineered config and ingestion pipeline, cache TTLs effectively disable caching |
+| 🟢 Low | 9 | Misnamed test files, skipped test suites, no linter, no `.dockerignore`, swagger version mismatch |
+
+The repo also contains an embedded answer key — every intentional defect is labeled with a `[DEF-XXX]` comment in the source code (DEF-001 through DEF-016). This analysis identified all 16 labeled defects plus 14 additional unlabeled issues.
+
+**Test suite state**: 48 tests total — 30 pass, 18 are skipped, 0 fail. However, passing tests do not mean correct behavior: the AggregationEngine tests assert a buggy percentile calculation as the expected result, and the integration tests verify their own mock handlers rather than the real application.
+
+**Docker operability**: The application could not run out of the box. Three fixes were required — a wrong Redis port, a macOS-specific health check path, and a hardcoded volume mount to the original author's machine. After applying these fixes, Docker Compose starts successfully.
+
+**Runtime behavior**: Both the ingest and query endpoints return HTTP 500 to clients despite the underlying operations completing successfully (data is persisted, queries execute). The error middleware catches something in the response chain and masks the real result. The health endpoint works but is meaningless — it always returns 200 regardless of dependency state.
+
+### Conclusion
+
+This codebase has significant security gaps (no auth, exposed credentials), functional bugs that affect every API response (logger inversion, blanket 500 errors), and substantial dead code that adds complexity without value. The documentation (README, Swagger) actively misleads consumers with wrong parameter names and routes. The test suite provides false confidence — green tests mask incorrect behavior, and critical paths have zero coverage.
+
+For a production deployment, the critical security issues (CRIT-1 through CRIT-5) and the functional bugs affecting every request (HIGH-1, HIGH-4) would need to be addressed first. The dead code (plugin system, unused services, over-engineered config) should be removed to reduce maintenance burden. The test suite needs significant rework — unskipping disabled tests, fixing incorrect assertions, and replacing mock-based integration tests with real application tests.
+
+---
+
+## Required Fixes to Run with Docker Compose
+
+The following changes were applied to successfully run `docker compose up`:
+
+### Fix 1: Redis Port in `.env.docker` `[DEF-001]`
+**Status**: ✅ FIXED  
+**Issue**: `.env.docker.example` sets `METRICS_REDIS_PORT=6380`, but Redis in `docker-compose.yml` runs on `6379`.  
+**Fix**: Changed `.env.docker` to `METRICS_REDIS_PORT=6379`.  
+**File**: `.env.docker` (line 20)
+
+### Fix 2: PostgreSQL Health Check Path `[DEF-011]`
+**Status**: ✅ FIXED  
+**Issue**: `docker-compose.yml` health check uses `/opt/homebrew/bin/psql` (macOS Homebrew path on Apple Silicon). This path does not exist in the Linux Docker container, causing the health check to fail and preventing the app service from starting.  
+**Fix**: Changed health check from `["CMD", "/opt/homebrew/bin/psql", ...]` to `["CMD-SHELL", "pg_isready -U postgres -d metricsapi"]`. The `pg_isready` utility is included in the Postgres image and works across all platforms.  
+**File**: `docker-compose.yml` (lines 54–62)
+
+### Fix 3: Hardcoded Volume Mount `[DEF-009]`
+**Status**: ✅ FIXED  
+**Issue**: `docker-compose.yml` hardcoded a volume mount to `/Users/alex/data:/app/data` (original author's macOS path), which does not exist on other machines.  
+**Fix**: Removed the volume mount entirely. The app does not currently use the `/app/data` directory.  
+**File**: `docker-compose.yml` (removed lines 32–33)
+
+### Minimal Setup to Run the Application
+
+After applying the three fixes above, the application runs successfully via Docker Compose:
+
+```bash
+docker compose up
+```
+
+This single command:
+- Builds the Docker image
+- Starts PostgreSQL 16 (with migrations automatically applied)
+- Starts Redis 7
+- Starts the MetricsAPI server on port 3000
+
+**Verification**: The API is available at `http://localhost:3000/health` and responds with `{"status":"ok"}`.
+
+**Note**: Do not run `npm start` locally while Docker Compose is running — both will try to bind port 3000. Either:
+- Keep Docker Compose running and access the API via `http://localhost:3000`
+- Stop Docker Compose and run local development with `npm run dev` (requires local postgres/redis)
+
+### Test Suite Fixes Applied
+
+#### Fix 1: Unskip MetricValidator Test Suite `[DEF-015]`
+**Status**: ✅ FIXED  
+**Issue**: `describe.skip('MetricValidator', () => { ... })` prevented all 11 validation tests from running  
+**Fix**: Changed to `describe('MetricValidator', () => { ... })` to enable the test suite  
+**File**: `tests/unit/MetricValidator.test.ts` (line 13)  
+**Result**: All 11 tests now run and pass
+
+#### Fix 2: Correct Jest Matcher in MetricValidator Test
+**Status**: ✅ FIXED  
+**Issue**: Test used `toContain(expect.stringContaining('name'))` which doesn't work with string arrays  
+**Fix**: Changed to `toEqual(expect.arrayContaining([expect.stringContaining('name')]))`  
+**File**: `tests/unit/MetricValidator.test.ts` (line 40)  
+**Test Output**: 
+```
+PASS tests/unit/MetricValidator.test.ts
+  MetricValidator › validate
+    ✓ should accept valid metric input
+    ✓ should reject missing name
+    ✓ should reject empty name
+    ✓ should reject name longer than 255 characters
+    ✓ should reject non-numeric value
+    ✓ should reject NaN value
+    ✓ should reject Infinity value
+    ✓ should accept epoch timestamp
+    ✓ should reject invalid timestamp string
+    ✓ should reject missing value
+    ✓ should reject null body
+
+Tests: 11 passed, 11 total
+```
+
+---
+
+## Test Suite Analysis
+
+### Overall Coverage
+- **Test Suites**: 7 total (6 pass, 1 skip)
+  - 6 passing suites: AggregationEngine, CacheManager, MetricController, MetricService, PluginEventBus, metrics.integration
+  - 1 skipped suite: MetricValidator
+- **Tests**: 48 total (30 pass, 18 skipped, 0 fail)
+
+### Passing Tests (30 total)
+
+| Suite | Test Name | Notes |
+|-------|-----------|-------|
+| **AggregationEngine** (3 pass) | `should return sum...` | ✅ Correct |
+| | `should return 0 for empty...` | ✅ Correct |
+| | `should handle single value` | ✅ Correct |
+| **CacheManager** (3 pass) | `should return undefined on cache miss` | ✅ Correct |
+| | `should store/retrieve from L1` | ✅ Correct |
+| | `should return cache stats` | ✅ Correct |
+| **MetricController** (4 pass) | `should return 201 on ingest` | ✅ Correct |
+| | `should call next on error` | ✅ Correct |
+| | `should return 200 on query` | ✅ Correct |
+| | `should call next on missing params` | ✅ Correct |
+| **MetricService** (3 pass) | `should process through pipeline` | ✅ Correct |
+| | `should validate input` | ✅ Correct |
+| | `should query with aggregation` | ✅ Correct |
+| **PluginEventBus** (5 pass) | `should register handlers` | ✅ Correct |
+| | `should emit events` | ✅ Correct |
+| | `should remove handlers` | ✅ Correct |
+| | `should log events` | ✅ Correct |
+| | `should clear handlers/log` | ✅ Correct |
+| **Integration** (3 pass) | `should return health status` | ✅ Correct |
+| | `should ingest metric` | ⚠️ Uses mock handlers, not real app |
+| | `should query with aggregation` | ⚠️ Uses mock handlers, not real app |
+
+### Skipped Tests (18 total)
+
+**MetricValidator.test.ts (0 tests, fully skipped)** `[DEF-015]`
+- Entire file wrapped in `describe.skip('MetricValidator', () => { ... })`
+- Validation tests never execute
+- **Impact**: Zero test coverage for critical input validation layer
+
+**CacheManager.test.ts (4 skipped)** `[DEF-015]`
+| Test | Line | Reason |
+|------|------|--------|
+| `should expire L1 cache after TTL` | 44 | `it.skip()` — TTL behavior untested |
+| `should fallthrough to L2 Redis on L1 miss` | 55 | `it.skip()` — L2 fallback untested |
+| `should invalidate cache in all tiers` | 63 | `it.skip()` — Invalidation untested |
+| `should clear all cached entries` | 73 | `it.skip()` — Clear operation untested |
+
+**metrics.integration.test.ts (3 skipped)** `[DEF-015]`
+| Test | Line | Reason |
+|------|------|--------|
+| `should reject invalid metric data` | 84 | `it.skip()` — Validation edge case untested |
+| `should return empty result for unknown metric` | 107 | `it.skip()` — Empty result handling untested |
+| `should handle concurrent ingestion` | 123 | `it.skip()` — Concurrency untested |
+
+### Test Defect Catalog
+
+#### TEST-1: AggregationEngine Tests Validate Buggy Percentile `[DEF-002]`
+- **File**: `tests/unit/AggregationEngine.test.ts` (lines 59-76)
+- **Issue**: Tests assert the Math.ceil-based percentile calculation (off-by-one) as the expected behavior
+- **Example**:
+  ```typescript
+  it('should calculate p50 of sorted array', () => {
+    const result = engine.aggregate([1, 2, 3, 4, 5], 'percentile', 50);
+    // [DEF-002] Math.ceil(50/100 * 5) - 1 = 3 - 1 = 2
+    // sorted[2] = 3
+    expect(result.value).toBe(3);  // ← Asserts buggy result as correct
+  });
+  ```
+- **Impact**: Tests pass ✅ but validate incorrect behavior. This is a deliberate trap — all tests green ≠ all behavior correct.
+
+#### TEST-2: MetricValidator Has Zero Test Coverage `[DEF-015]`
+- **File**: `tests/unit/MetricValidator.test.ts` (line 13)
+- **Issue**: `describe.skip('MetricValidator', () => { ... })` — entire test suite disabled
+- **Tests Prevented** (128 lines of tests exist but never run):
+  - Valid input acceptance
+  - Missing field rejection
+  - Empty field rejection
+  - Name length validation (max 255 chars)
+  - *...and 18+ more validation scenarios*
+- **Impact**: Critical validation layer has zero automated coverage. Bugs in validation logic won't be caught by tests.
+
+#### TEST-3: CacheManager Behavior Tests Skipped `[DEF-015]`
+- **File**: `tests/unit/CacheManager.test.ts` (lines 44, 55, 63, 73)
+- **Tests Skipped**:
+  - L1 cache TTL expiry (critical for correctness)
+  - L2 Redis fallthrough (core 3-tier cache feature)
+  - Cache invalidation (data consistency)
+  - Cache clear (cleanup operation)
+- **Impact**: The multi-tier cache behavior is untested. Cache correctness cannot be verified.
+
+#### TEST-4: Integration Tests Use Mock Handlers, Not Real App
+- **File**: `tests/integration/metrics.integration.test.ts` (lines 25–55)
+- **Issue**: Creates a fresh Express app with hardcoded mock route handlers instead of importing the real app
+  ```typescript
+  // Mock handler: just returns mock data, doesn't test real routes
+  mockApp.get('/health', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
+  ```
+- **Impact**: Tests verify that the test's own mocks work correctly, not that the application works. Full end-to-end integration is not tested.
+
+#### TEST-5: Edge Cases and Concurrency Untested `[DEF-015]`
+- **File**: `tests/integration/metrics.integration.test.ts` (lines 84, 107, 123)
+- **Tests Skipped**:
+  - Invalid metric rejection
+  - Empty result handling
+  - Concurrent ingestion (race conditions)
+- **Impact**: Concurrency issues, race conditions, and validation error paths are untested.
+
+### Test Quality Issues
+
+| Issue | Severity | Files | Impact |
+|-------|----------|-------|--------|
+| Entire validation suite skipped | 🔴 High | MetricValidator.test.ts | Zero validation coverage |
+| Buggy behavior validated as correct | 🟠 Medium | AggregationEngine.test.ts | False confidence in passing tests |
+| Cache behavior untested | 🟠 Medium | CacheManager.test.ts | Cache correctness unknown |
+| Integration tests mock instead of test | 🟠 Medium | metrics.integration.test.ts | Real integration not verified |
+| Edge cases skipped | 🟡 Medium | metrics.integration.test.ts | Edge cases untested |
+| No config system tests | 🟡 Medium | — | ConfigProvider/Resolver/Validator untested |
+| No storage layer tests | 🟡 Medium | — | PostgresStorageProvider untested |
+| No middleware tests | 🟡 Medium | — | errorHandler untested |
+| No model binding tests | 🟡 Medium | — | TypeScript models untested |
+
+### Lines of Code Analysis
+
+| Module | File | Lines | Test Coverage |
+|--------|------|-------|---|
+| MetricValidator | `src/validation/MetricValidator.ts` | ~100 | ❌ 0% (suite skipped) |
+| CacheManager | `src/cache/CacheManager.ts` | ~165 | ⚠️ ~40% (tier behavior skipped) |
+| ConfigValidator | `src/config/ConfigValidator.ts` | ~269 | ❌ 0% |
+| ConfigResolver | `src/config/ConfigResolver.ts` | ~144 | ❌ 0% |
+| PostgresStorageProvider | `src/storage/PostgresStorageProvider.ts` | ~120 | ❌ 0% |
+| MetricNormalizer | `src/normalization/MetricNormalizer.ts` | ~60 | ❌ 0% |
+| MetricEnricher | `src/enrichment/MetricEnricher.ts` | ~70 | ❌ 0% |
+| MetricRouter | `src/routing/MetricRouter.ts` | ~60 | ❌ 0% |
+
+### Modules With Zero Test Coverage
+
+| Module | File |
+|--------|------|
+| MetricNormalizer | [src/normalization/MetricNormalizer.ts](src/normalization/MetricNormalizer.ts) |
+| MetricEnricher | [src/enrichment/MetricEnricher.ts](src/enrichment/MetricEnricher.ts) |
+| MetricRouter | [src/routing/MetricRouter.ts](src/routing/MetricRouter.ts) |
+| StorageAdapter | [src/storage/StorageAdapter.ts](src/storage/StorageAdapter.ts) |
+| PostgresStorageProvider | [src/storage/PostgresStorageProvider.ts](src/storage/PostgresStorageProvider.ts) |
+| ConfigProvider | [src/config/ConfigProvider.ts](src/config/ConfigProvider.ts) |
+| ConfigResolver | [src/config/ConfigResolver.ts](src/config/ConfigResolver.ts) |
+| ConfigValidator | [src/config/ConfigValidator.ts](src/config/ConfigValidator.ts) |
+| errorHandler | [src/middleware/errorHandler.ts](src/middleware/errorHandler.ts) |
+| PluginLifecycleManager | [src/plugins/PluginLifecycleManager.ts](src/plugins/PluginLifecycleManager.ts) |
+| PluginRegistry | [src/plugins/PluginRegistry.ts](src/plugins/PluginRegistry.ts) |
+| AlertRuleService | [src/services/AlertRuleService.ts](src/services/AlertRuleService.ts) |
+| MetricMetadataService | [src/services/MetricMetadataService.ts](src/services/MetricMetadataService.ts) |
+
+---
+
+## Summary Table
+
+| ID | Severity | Description | DEF Label |
+|----|----------|-------------|-----------|
+| CRIT-1 | 🔴 Critical | Hardcoded password in 3 locations | DEF-010 |
+| CRIT-2 | 🔴 Critical | No authentication on any endpoint | — |
+| CRIT-3 | 🔴 Critical | Docker container runs as root | — |
+| CRIT-4 | 🔴 Critical | Redis exposed with no password | — |
+| CRIT-5 | 🔴 Critical | No rate limiting | — |
+| HIGH-1 | 🟠 High | Logger inverted — errors suppressed | DEF-013 |
+| HIGH-2 | 🟠 High | Percentile off-by-one; p100 rejected | DEF-002 |
+| HIGH-3 | 🟠 High | Health check always returns 200 | DEF-003 |
+| HIGH-4 | 🟠 High | All errors return HTTP 500 | DEF-012 |
+| HIGH-5 | 🟠 High | Config validation errors ignored at startup | — |
+| HIGH-6 | 🟠 High | Wrong Redis port in .env.docker.example | DEF-001 |
+| MED-1 | 🟡 Medium | Swagger routes don't match real routes | DEF-008 |
+| MED-2 | 🟡 Medium | README documents wrong params and types | — |
+| MED-3 | 🟡 Medium | Hardcoded volume mount to author's path | DEF-009 |
+| MED-4 | 🟡 Medium | macOS-specific psql path in health check | DEF-011 |
+| MED-5 | 🟡 Medium | Cache TTLs too short; KEYS blocks Redis | DEF-006 |
+| MED-6 | 🟡 Medium | ~460 lines of unused plugin system | DEF-005 |
+| MED-7 | 🟡 Medium | Unused services, models, migrations | DEF-014 |
+| MED-8 | 🟡 Medium | Over-engineered config for 8 values; fake YAML/TOML | DEF-007 |
+| MED-9 | 🟡 Medium | 8-layer pipeline; enricher data never persisted | DEF-004 |
+| MED-10 | 🟡 Medium | MetricValidator test suite entirely skipped | DEF-015 |
+| LOW-1 | 🟢 Low | MetricService.test.ts tests the controller | DEF-016 |
+| LOW-2 | 🟢 Low | Integration tests use mock handlers | — |
+| LOW-3 | 🟢 Low | Tests assert buggy percentile as correct | — |
+| LOW-4 | 🟢 Low | Additional skipped tests (cache, integration) | DEF-015 |
+| LOW-5 | 🟢 Low | Undocumented `median` aggregation type | — |
+| LOW-6 | 🟢 Low | Swagger version mismatch (0.9.0 vs 0.1.0) | — |
+| LOW-7 | 🟢 Low | lint script is a no-op | — |
+| LOW-8 | 🟢 Low | No .dockerignore | — |
+| LOW-9 | 🟢 Low | Deprecated `version` key in docker-compose.yml | — |
+| TEST-1 | 🟡 Medium | AggregationEngine tests validate buggy percentile | DEF-002 |
+| TEST-2 | 🟠 High | MetricValidator has zero test coverage | DEF-015 |
+| TEST-3 | 🟡 Medium | Cache behavior tests skipped (4 tests) | DEF-015 |
+| TEST-4 | 🟡 Medium | Integration tests use mock handlers, not real app | — |
+| TEST-5 | 🟡 Medium | Edge case tests skipped (invalid data, concurrency) | DEF-015 |
+
+---
+
 ## Severity Guide
 
 | Severity | Description |
@@ -17,13 +334,7 @@
 
 ---
 
-## Findings
-
-> **Test run results**: 7 suites (1 fully skipped), 48 tests — 30 passed, 18 skipped, 0 failed. `npm test` exits with code 1 (because of the skipped suite being counted as a failure by Jest).
-
-> **Meta-observation**: Every intentional defect in this repo is labeled with a `[DEF-XXX]` comment in the source code — the repo contains its own embedded answer key (DEF-001 through DEF-016). Findings below track both the labeled defects and issues discovered beyond them.
-
----
+## Detailed Findings
 
 ### 🔴 Critical — Security
 
@@ -279,292 +590,7 @@ The repo has no `.dockerignore` file. The Docker build context includes `node_mo
 
 ---
 
-## Modules With Zero Test Coverage
-
-The following modules have no tests (unit or integration) whatsoever:
-
-| Module | File |
-|--------|------|
-| MetricNormalizer | [src/normalization/MetricNormalizer.ts](src/normalization/MetricNormalizer.ts) |
-| MetricEnricher | [src/enrichment/MetricEnricher.ts](src/enrichment/MetricEnricher.ts) |
-| MetricRouter | [src/routing/MetricRouter.ts](src/routing/MetricRouter.ts) |
-| StorageAdapter | [src/storage/StorageAdapter.ts](src/storage/StorageAdapter.ts) |
-| PostgresStorageProvider | [src/storage/PostgresStorageProvider.ts](src/storage/PostgresStorageProvider.ts) |
-| ConfigProvider | [src/config/ConfigProvider.ts](src/config/ConfigProvider.ts) |
-| ConfigResolver | [src/config/ConfigResolver.ts](src/config/ConfigResolver.ts) |
-| ConfigValidator | [src/config/ConfigValidator.ts](src/config/ConfigValidator.ts) |
-| errorHandler | [src/middleware/errorHandler.ts](src/middleware/errorHandler.ts) |
-| PluginLifecycleManager | [src/plugins/PluginLifecycleManager.ts](src/plugins/PluginLifecycleManager.ts) |
-| PluginRegistry | [src/plugins/PluginRegistry.ts](src/plugins/PluginRegistry.ts) |
-| AlertRuleService | [src/services/AlertRuleService.ts](src/services/AlertRuleService.ts) |
-| MetricMetadataService | [src/services/MetricMetadataService.ts](src/services/MetricMetadataService.ts) |
-
----
-
-## Summary Table
-
-| ID | Severity | Description | DEF Label |
-|----|----------|-------------|-----------|
-| CRIT-1 | 🔴 Critical | Hardcoded password in 3 locations | DEF-010 |
-| CRIT-2 | 🔴 Critical | No authentication on any endpoint | — |
-| CRIT-3 | 🔴 Critical | Docker container runs as root | — |
-| CRIT-4 | 🔴 Critical | Redis exposed with no password | — |
-| CRIT-5 | 🔴 Critical | No rate limiting | — |
-| HIGH-1 | 🟠 High | Logger inverted — errors suppressed | DEF-013 |
-| HIGH-2 | 🟠 High | Percentile off-by-one; p100 rejected | DEF-002 |
-| HIGH-3 | 🟠 High | Health check always returns 200 | DEF-003 |
-| HIGH-4 | 🟠 High | All errors return HTTP 500 | DEF-012 |
-| HIGH-5 | 🟠 High | Config validation errors ignored at startup | — |
-| HIGH-6 | 🟠 High | Wrong Redis port in .env.docker.example | DEF-001 |
-| MED-1 | 🟡 Medium | Swagger routes don't match real routes | DEF-008 |
-| MED-2 | 🟡 Medium | README documents wrong params and types | — |
-| MED-3 | 🟡 Medium | Hardcoded volume mount to author's path | DEF-009 |
-| MED-4 | 🟡 Medium | macOS-specific psql path in health check | DEF-011 |
-| MED-5 | 🟡 Medium | Cache TTLs too short; KEYS blocks Redis | DEF-006 |
-| MED-6 | 🟡 Medium | ~460 lines of unused plugin system | DEF-005 |
-| MED-7 | 🟡 Medium | Unused services, models, migrations | DEF-014 |
-| MED-8 | 🟡 Medium | Over-engineered config for 8 values; fake YAML/TOML | DEF-007 |
-| MED-9 | 🟡 Medium | 8-layer pipeline; enricher data never persisted | DEF-004 |
-| MED-10 | 🟡 Medium | MetricValidator test suite entirely skipped | DEF-015 |
-| LOW-1 | 🟢 Low | MetricService.test.ts tests the controller | DEF-016 |
-| LOW-2 | 🟢 Low | Integration tests use mock handlers | — |
-| LOW-3 | 🟢 Low | Tests assert buggy percentile as correct | — |
-| LOW-4 | 🟢 Low | Additional skipped tests (cache, integration) | DEF-015 |
-| LOW-5 | 🟢 Low | Undocumented `median` aggregation type | — |
-| LOW-6 | 🟢 Low | Swagger version mismatch (0.9.0 vs 0.1.0) | — |
-| LOW-7 | 🟢 Low | lint script is a no-op | — |
-| LOW-8 | 🟢 Low | No .dockerignore | — |
-| LOW-9 | 🟢 Low | Deprecated `version` key in docker-compose.yml | — |
-| TEST-1 | 🟡 Medium | AggregationEngine tests validate buggy percentile | DEF-002 |
-| TEST-2 | 🟠 High | MetricValidator has zero test coverage | DEF-015 |
-| TEST-3 | 🟡 Medium | Cache behavior tests skipped (4 tests) | DEF-015 |
-| TEST-4 | 🟡 Medium | Integration tests use mock handlers, not real app | — |
-| TEST-5 | 🟡 Medium | Edge case tests skipped (invalid data, concurrency) | DEF-015 |
-
-*(To be populated during Phase 3)*
-
----
-
-## Required Fixes to Run with Docker Compose
-
-The following changes must be made to successfully run `docker compose up`:
-
-### Fix 1: Redis Port in `.env.docker` `[DEF-001]`
-**Status**: ✅ FIXED
-**Issue**: `.env.docker.example` sets `METRICS_REDIS_PORT=6380`, but Redis in `docker-compose.yml` runs on `6379`.
-**Fix**: Changed `.env.docker` to `METRICS_REDIS_PORT=6379`.
-**File**: `.env.docker` (line 20)
-
-### Fix 2: PostgreSQL Health Check Path `[DEF-011]`
-**Status**: ✅ FIXED
-**Issue**: `docker-compose.yml` health check uses `/opt/homebrew/bin/psql` (macOS Homebrew path on Apple Silicon). This path does not exist in the Linux Docker container, causing the health check to fail and preventing the app service from starting.
-**Fix**: Changed health check from `["CMD", "/opt/homebrew/bin/psql", ...]` to `["CMD-SHELL", "pg_isready -U postgres -d metricsapi"]`. The `pg_isready` utility is included in the Postgres image and works across all platforms.
-**File**: `docker-compose.yml` (lines 54–62)
-
-### Fix 3: Hardcoded Volume Mount `[DEF-009]`
-**Status**: ✅ FIXED
-**Issue**: `docker-compose.yml` hardcoded a volume mount to `/Users/alex/data:/app/data` (original author's macOS path), which does not exist on other machines.
-**Fix**: Removed the volume mount entirely. The app does not currently use the `/app/data` directory.
-**File**: `docker-compose.yml` (removed lines 32–33)
-
-### Minimal Setup to Run the Application
-
-After applying the three fixes above, the application runs successfully via Docker Compose:
-
-```bash
-docker compose up
-```
-
-This single command:
-- Builds the Docker image
-- Starts PostgreSQL 16 (with migrations automatically applied)
-- Starts Redis 7
-- Starts the MetricsAPI server on port 3000
-
-**Verification**: The API is available at `http://localhost:3000/health` and responds with `{"status":"ok"}`.
-
-**Note**: Do not run `npm start` locally while Docker Compose is running — both will try to bind port 3000. Either:
-- Keep Docker Compose running and access the API via `http://localhost:3000`
-- Stop Docker Compose and run local development with `npm run dev` (requires local postgres/redis)
-
-### Test Suite Fixes Applied
-
-#### Fix 1: Unskip MetricValidator Test Suite `[DEF-015]`
-**Status**: ✅ FIXED
-**Issue**: `describe.skip('MetricValidator', () => { ... })` prevented all 11 validation tests from running
-**Fix**: Changed to `describe('MetricValidator', () => { ... })` to enable the test suite
-**File**: `tests/unit/MetricValidator.test.ts` (line 13)
-**Result**: All 11 tests now run and pass
-
-#### Fix 2: Correct Jest Matcher in MetricValidator Test
-**Status**: ✅ FIXED
-**Issue**: Test used `toContain(expect.stringContaining('name'))` which doesn't work with string arrays
-**Fix**: Changed to `toEqual(expect.arrayContaining([expect.stringContaining('name')]))`
-**File**: `tests/unit/MetricValidator.test.ts` (line 40)
-**Test Output**: 
-```
-PASS tests/unit/MetricValidator.test.ts
-  MetricValidator › validate
-    ✓ should accept valid metric input
-    ✓ should reject missing name
-    ✓ should reject empty name
-    ✓ should reject name longer than 255 characters
-    ✓ should reject non-numeric value
-    ✓ should reject NaN value
-    ✓ should reject Infinity value
-    ✓ should accept epoch timestamp
-    ✓ should reject invalid timestamp string
-    ✓ should reject missing value
-    ✓ should reject null body
-
-Tests: 11 passed, 11 total
-```
-
----
-
-## Test Suite Analysis
-
-### Overall Coverage
-- **Test Suites**: 7 total (6 pass, 1 skip)
-  - 6 passing suites: AggregationEngine, CacheManager, MetricController, MetricService, PluginEventBus, metrics.integration
-  - 1 skipped suite: MetricValidator
-- **Tests**: 48 total (30 pass, 18 skipped, 0 fail)
-
-### Passing Tests (30 total)
-
-| Suite | Test Name | Notes |
-|-------|-----------|-------|
-| **AggregationEngine** (3 pass) | `should return sum...` | ✅ Correct |
-| | `should return 0 for empty...` | ✅ Correct |
-| | `should handle single value` | ✅ Correct |
-| **CacheManager** (3 pass) | `should return undefined on cache miss` | ✅ Correct |
-| | `should store/retrieve from L1` | ✅ Correct |
-| | `should return cache stats` | ✅ Correct |
-| **MetricController** (4 pass) | `should return 201 on ingest` | ✅ Correct |
-| | `should call next on error` | ✅ Correct |
-| | `should return 200 on query` | ✅ Correct |
-| | `should call next on missing params` | ✅ Correct |
-| **MetricService** (3 pass) | `should process through pipeline` | ✅ Correct |
-| | `should validate input` | ✅ Correct |
-| | `should query with aggregation` | ✅ Correct |
-| **PluginEventBus** (5 pass) | `should register handlers` | ✅ Correct |
-| | `should emit events` | ✅ Correct |
-| | `should remove handlers` | ✅ Correct |
-| | `should log events` | ✅ Correct |
-| | `should clear handlers/log` | ✅ Correct |
-| **Integration** (3 pass) | `should return health status` | ✅ Correct |
-| | `should ingest metric` | ⚠️ Uses mock handlers, not real app |
-| | `should query with aggregation` | ⚠️ Uses mock handlers, not real app |
-
-### Skipped Tests (18 total)
-
-**MetricValidator.test.ts (0 tests, fully skipped)** `[DEF-015]`
-- Entire file wrapped in `describe.skip('MetricValidator', () => { ... })`
-- Validation tests never execute
-- **Impact**: Zero test coverage for critical input validation layer
-
-**CacheManager.test.ts (4 skipped)** `[DEF-015]`
-| Test | Line | Reason |
-|------|------|--------|
-| `should expire L1 cache after TTL` | 44 | `it.skip()` — TTL behavior untested |
-| `should fallthrough to L2 Redis on L1 miss` | 55 | `it.skip()` — L2 fallback untested |
-| `should invalidate cache in all tiers` | 63 | `it.skip()` — Invalidation untested |
-| `should clear all cached entries` | 73 | `it.skip()` — Clear operation untested |
-
-**metrics.integration.test.ts (3 skipped)** `[DEF-015]`
-| Test | Line | Reason |
-|------|------|--------|
-| `should reject invalid metric data` | 84 | `it.skip()` — Validation edge case untested |
-| `should return empty result for unknown metric` | 107 | `it.skip()` — Empty result handling untested |
-| `should handle concurrent ingestion` | 123 | `it.skip()` — Concurrency untested |
-
-### Test Defect Catalog
-
-#### TEST-1: AggregationEngine Tests Validate Buggy Percentile `[DEF-002]`
-- **File**: `tests/unit/AggregationEngine.test.ts` (lines 59-76)
-- **Issue**: Tests assert the Math.ceil-based percentile calculation (off-by-one) as the expected behavior
-- **Example**:
-  ```typescript
-  it('should calculate p50 of sorted array', () => {
-    const result = engine.aggregate([1, 2, 3, 4, 5], 'percentile', 50);
-    // [DEF-002] Math.ceil(50/100 * 5) - 1 = 3 - 1 = 2
-    // sorted[2] = 3
-    expect(result.value).toBe(3);  // ← Asserts buggy result as correct
-  });
-  ```
-- **Impact**: Tests pass ✅ but validate incorrect behavior. This is a deliberate trap — all tests green ≠ all behavior correct.
-
-#### TEST-2: MetricValidator Has Zero Test Coverage `[DEF-015]`
-- **File**: `tests/unit/MetricValidator.test.ts` (line 13)
-- **Issue**: `describe.skip('MetricValidator', () => { ... })` — entire test suite disabled
-- **Tests Prevented** (128 lines of tests exist but never run):
-  - Valid input acceptance
-  - Missing field rejection
-  - Empty field rejection
-  - Name length validation (max 255 chars)
-  - *...and 18+ more validation scenarios*
-- **Impact**: Critical validation layer has zero automated coverage. Bugs in validation logic won't be caught by tests.
-
-#### TEST-3: CacheManager Behavior Tests Skipped `[DEF-015]`
-- **File**: `tests/unit/CacheManager.test.ts` (lines 44, 55, 63, 73)
-- **Tests Skipped**:
-  - L1 cache TTL expiry (critical for correctness)
-  - L2 Redis fallthrough (core 3-tier cache feature)
-  - Cache invalidation (data consistency)
-  - Cache clear (cleanup operation)
-- **Impact**: The multi-tier cache behavior is untested. Cache correctness cannot be verified.
-
-#### TEST-4: Integration Tests Use Mock Handlers, Not Real App
-- **File**: `tests/integration/metrics.integration.test.ts` (lines 25–55)
-- **Issue**: Creates a fresh Express app with hardcoded mock route handlers instead of importing the real app
-  ```typescript
-  // Mock handler: just returns mock data, doesn't test real routes
-  mockApp.get('/health', (_req, res) => {
-    res.json({ status: 'ok' });
-  });
-  ```
-- **Impact**: Tests verify that the test's own mocks work correctly, not that the application works. Full end-to-end integration is not tested.
-
-#### TEST-5: Edge Cases and Concurrency Untested `[DEF-015]`
-- **File**: `tests/integration/metrics.integration.test.ts` (lines 84, 107, 123)
-- **Tests Skipped**:
-  - Invalid metric rejection
-  - Empty result handling
-  - Concurrent ingestion (race conditions)
-- **Impact**: Concurrency issues, race conditions, and validation error paths are untested.
-
-### Test Quality Issues
-
-| Issue | Severity | Files | Impact |
-|-------|----------|-------|--------|
-| Entire validation suite skipped | 🔴 High | MetricValidator.test.ts | Zero validation coverage |
-| Buggy behavior validated as correct | 🟠 Medium | AggregationEngine.test.ts | False confidence in passing tests |
-| Cache behavior untested | 🟠 Medium | CacheManager.test.ts | Cache correctness unknown |
-| Integration tests mock instead of test | 🟠 Medium | metrics.integration.test.ts | Real integration not verified |
-| Edge cases skipped | 🟡 Medium | metrics.integration.test.ts | Edge cases untested |
-| No config system tests | 🟡 Medium | — | ConfigProvider/Resolver/Validator untested |
-| No storage layer tests | 🟡 Medium | — | PostgresStorageProvider untested |
-| No middleware tests | 🟡 Medium | — | errorHandler untested |
-| No model binding tests | 🟡 Medium | — | TypeScript models untested |
-
-### Lines of Code Analysis
-
-| Module | File | Lines | Test Coverage |
-|--------|------|-------|---|
-| MetricValidator | `src/validation/MetricValidator.ts` | ~100 | ❌ 0% (suite skipped) |
-| CacheManager | `src/cache/CacheManager.ts` | ~165 | ⚠️ ~40% (tier behavior skipped) |
-| ConfigValidator | `src/config/ConfigValidator.ts` | ~269 | ❌ 0% |
-| ConfigResolver | `src/config/ConfigResolver.ts` | ~144 | ❌ 0% |
-| PostgresStorageProvider | `src/storage/PostgresStorageProvider.ts` | ~120 | ❌ 0% |
-| MetricNormalizer | `src/normalization/MetricNormalizer.ts` | ~60 | ❌ 0% |
-| MetricEnricher | `src/enrichment/MetricEnricher.ts` | ~70 | ❌ 0% |
-| MetricRouter | `src/routing/MetricRouter.ts` | ~60 | ❌ 0% |
-
----
-
-*(Phase 4 — requires Docker or local postgres/redis)*
-
-### Confirmed Runtime Behavior (Docker Compose)
+## Confirmed Runtime Behavior (Docker Compose)
 
 **Ingest Endpoint (`POST /v1/metrics`)**
 - Request: Valid metric data matching the README example
@@ -587,7 +613,7 @@ Tests: 11 passed, 11 total
 - ✅ Returns `{ status: "ok" }` with HTTP 200 as documented
 - Works correctly despite Redis connection failures
 
-### Issues Identified
+### Runtime Issues Identified
 
 **RUNTIME-1: Ingest Returns Error Despite Successful Persistence**
 Operations complete successfully and persist data, but the error middleware is returning 500 responses to clients. The error is being thrown somewhere in the response handling, not in the ingestion pipeline itself. Requires debugging to identify where in the response chain the exception occurs.
@@ -609,15 +635,3 @@ The app continues to work (writes to Postgres, queries execute) because Redis co
 - `POST /v1/metrics` with valid body should succeed; enricher metadata will be silently discarded (MED-9) — ⚠️ **Partially confirmed** (data is persisted but returns 500)
 - No `logger.error()` output will appear at the default log level (HIGH-1) — ✅ **Confirmed**
 - `docker-compose up` successfully starts all services — ✅ **Confirmed** (fixes applied)
-
----
-
-## Summary
-
-| Severity | Count |
-|----------|-------|
-| 🔴 Critical | 5 |
-| 🟠 High | 6 |
-| 🟡 Medium | 10 |
-| 🟢 Low | 9 |
-| **Total** | **30** |
